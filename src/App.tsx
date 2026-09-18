@@ -11,16 +11,33 @@ import {
   rectKey,
   scanDocument,
 } from './pdf/textSearch';
+import {
+  buildScheme,
+  countSchemeBoxes,
+  downloadScheme,
+  mergeScheme,
+  parseScheme,
+  schemeToRedactionMap,
+  validateSchemeMatch,
+  SchemeError,
+  type RedactionScheme,
+} from './pdf/scheme';
+import { sha256Hex } from './pdf/sha256';
 import { Toolbar } from './components/Toolbar';
 import { PageList } from './components/PageList';
 import { PageCanvas } from './components/PageCanvas';
 import { FindPanel, type FindStatus } from './components/FindPanel';
+import { ImportDialog } from './components/ImportDialog';
 
 const ZOOM_LEVELS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 
 export default function App() {
   const [doc, setDoc] = useState<PDFDocumentProxy | null>(null);
   const [fileName, setFileName] = useState('');
+  /** 当前文档源文件的 SHA-256（小写十六进制），加载时在浏览器本地计算 */
+  const [sourceHash, setSourceHash] = useState('');
+  /** 各页未旋转尺寸（点），与遮盖框坐标同一坐标系，用于方案导出 / 导入校验 */
+  const [pageSizes, setPageSizes] = useState<{ width: number; height: number }[]>([]);
   const [page, setPage] = useState<PDFPageProxy | null>(null);
   const [pageNum, setPageNum] = useState(1);
   const [zoom, setZoom] = useState(1.25);
@@ -30,7 +47,12 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** 非错误类提示（如导入成功），与错误条分开显示 */
+  const [notice, setNotice] = useState<string | null>(null);
+  /** 通过校验、等待用户选择替换 / 合并的方案 */
+  const [pendingScheme, setPendingScheme] = useState<RedactionScheme | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const schemeInputRef = useRef<HTMLInputElement>(null);
 
   // ---- 文本查找遮盖 ----
   const [findOpen, setFindOpen] = useState(false);
@@ -70,14 +92,27 @@ export default function App() {
   const openFile = useCallback(
     async (file: File) => {
       setError(null);
+      setNotice(null);
+      setPendingScheme(null);
       scanToken.current += 1; // 中止进行中的查找扫描
       cancelToken.current += 1;
       try {
         const data = await file.arrayBuffer();
+        // 加载前在浏览器本地计算源文件 SHA-256（subtle 不可用时自动回退纯 JS 实现）
+        const hash = await sha256Hex(data);
         const pdf = await pdfjs.getDocument({ data }).promise;
+        // 收集各页未旋转尺寸（与遮盖框坐标同一坐标系），供方案导出 / 导入校验使用
+        const sizes: { width: number; height: number }[] = [];
+        for (let n = 1; n <= pdf.numPages; n += 1) {
+          const p = await pdf.getPage(n);
+          const base = p.getViewport({ scale: 1, rotation: 0 });
+          sizes.push({ width: base.width, height: base.height });
+        }
         void doc?.destroy();
         setDoc(pdf);
         setFileName(file.name);
+        setSourceHash(hash);
+        setPageSizes(sizes);
         setPageNum(1);
         setRotation(0);
         setSelectedId(null);
@@ -407,6 +442,87 @@ export default function App() {
     }
   };
 
+  // ================= 遮盖方案导入 / 导出 =================
+
+  const onExportScheme = () => {
+    if (!doc || pageSizes.length !== doc.numPages) return;
+    setError(null);
+    try {
+      const scheme = buildScheme(sourceHash, fileName, doc.numPages, pageSizes, redactions);
+      downloadScheme(scheme);
+      setNotice('遮盖方案已导出为 JSON（含源文件 SHA-256 与各页尺寸），全程仅在本机完成。');
+    } catch {
+      setError('导出方案失败，请重试。');
+    }
+  };
+
+  /**
+   * 导入方案：先做结构校验（格式损坏），再做文档匹配（哈希 / 页数 / 尺寸 / 边界）。
+   * 任一项不符立即拒绝并保持现状；全部通过才弹出“替换 / 合并”选择。
+   */
+  const onPickSchemeFile = async (file: File) => {
+    if (!doc) return;
+    setError(null);
+    setNotice(null);
+    let text: string;
+    try {
+      text = await file.text();
+    } catch {
+      setError('读取方案文件失败，请重试。');
+      return;
+    }
+    let scheme: RedactionScheme;
+    try {
+      scheme = parseScheme(text);
+    } catch (e) {
+      setError(
+        e instanceof SchemeError
+          ? `方案格式损坏，已拒绝导入：${e.message}`
+          : '方案文件格式损坏，已拒绝导入。',
+      );
+      return;
+    }
+    try {
+      validateSchemeMatch(scheme, sourceHash, pageSizes);
+    } catch (e) {
+      setError(
+        e instanceof SchemeError
+          ? `方案与当前文档不匹配，已拒绝导入：${e.message}`
+          : '方案与当前文档不匹配，已拒绝导入。',
+      );
+      return;
+    }
+    setPendingScheme(scheme);
+  };
+
+  const applyImportReplace = () => {
+    const scheme = pendingScheme;
+    if (!scheme) return;
+    // 一次 set 即一条撤销记录
+    setRedactions(schemeToRedactionMap(scheme));
+    setSelectedId(null);
+    setPendingScheme(null);
+    setNotice(`已用方案替换当前遮盖，共 ${countSchemeBoxes(scheme)} 处；可 Ctrl+Z 撤销。`);
+  };
+
+  const applyImportMerge = () => {
+    const scheme = pendingScheme;
+    if (!scheme) return;
+    const base = redactionsRef.current;
+    const { map, added, skipped } = mergeScheme(base, scheme);
+    if (added === 0) {
+      setPendingScheme(null);
+      setNotice('方案中的遮盖与现有遮盖全部重复（0.01 点容差内），未新增任何遮盖。');
+      return;
+    }
+    setRedactions(map); // 整次导入仅一条撤销记录
+    setSelectedId(null);
+    setPendingScheme(null);
+    setNotice(
+      `已合并导入 ${added} 处遮盖${skipped > 0 ? `，另有 ${skipped} 处重复已跳过` : ''}；可 Ctrl+Z 撤销。`,
+    );
+  };
+
   return (
     <div className="app">
       <input
@@ -417,6 +533,17 @@ export default function App() {
         onChange={(e) => {
           const file = e.target.files?.[0];
           if (file) void openFile(file);
+          e.target.value = '';
+        }}
+      />
+      <input
+        ref={schemeInputRef}
+        type="file"
+        accept="application/json,.json"
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void onPickSchemeFile(file);
           e.target.value = '';
         }}
       />
@@ -431,6 +558,7 @@ export default function App() {
         canRedo={canRedo}
         exporting={exporting}
         findOpen={findOpen}
+        canUseScheme={!!doc && pageSizes.length === numPages && sourceHash.length === 64}
         onOpen={() => fileInputRef.current?.click()}
         onToolChange={setTool}
         onToggleFind={() => setFindOpen((v) => !v)}
@@ -443,9 +571,12 @@ export default function App() {
         onRedo={redo}
         onClearPage={clearPage}
         onExport={() => void onExport()}
+        onExportScheme={onExportScheme}
+        onImportScheme={() => schemeInputRef.current?.click()}
       />
 
       {error && <div className="error-bar">{error}</div>}
+      {notice && !error && <div className="notice-bar">{notice}</div>}
       {progress && (
         <div className="progress-bar">
           正在按 144 DPI 栅格化并烧入遮盖：第 {progress.done} / {progress.total} 页
@@ -520,6 +651,16 @@ export default function App() {
           </>
         )}
       </footer>
+
+      {pendingScheme && (
+        <ImportDialog
+          scheme={pendingScheme}
+          currentBoxCount={totalBoxes}
+          onReplace={applyImportReplace}
+          onMerge={applyImportMerge}
+          onCancel={() => setPendingScheme(null)}
+        />
+      )}
     </div>
   );
 }

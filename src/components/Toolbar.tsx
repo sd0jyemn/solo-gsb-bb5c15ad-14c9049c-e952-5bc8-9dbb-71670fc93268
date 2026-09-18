@@ -10,6 +10,8 @@ interface Props {
   canRedo: boolean;
   exporting: boolean;
   findOpen: boolean;
+  /** 各页尺寸尚未收集完成时，方案导出暂不可用 */
+  canUseScheme: boolean;
   onOpen(): void;
   onToolChange(tool: Tool): void;
   onToggleFind(): void;
@@ -22,6 +24,8 @@ interface Props {
   onRedo(): void;
   onClearPage(): void;
   onExport(): void;
+  onExportScheme(): void;
+  onImportScheme(): void;
 }
 
 export function Toolbar(props: Props) {
@@ -35,6 +39,7 @@ export function Toolbar(props: Props) {
     canRedo,
     exporting,
     findOpen,
+    canUseScheme,
   } = props;
 
   return (
@@ -112,6 +117,22 @@ export function Toolbar(props: Props) {
       <button disabled={!hasDoc} onClick={props.onClearPage} title="删除当前页全部遮盖框">
         清空本页
       </button>
+      <div className="sep" />
+      <button
+        disabled={!hasDoc || !canUseScheme}
+        onClick={props.onImportScheme}
+        title="从 JSON 方案文件导入遮盖（先校验哈希/页数/尺寸/边界，再选择替换或合并，纯本地）"
+      >
+        导入方案
+      </button>
+      <button
+        disabled={!hasDoc || !canUseScheme}
+        onClick={props.onExportScheme}
+        title="把全部页面的遮盖框导出为 JSON 方案（含源文件 SHA-256，纯本地）"
+      >
+        导出方案
+      </button>
+      <div className="sep" />
       <button className="primary" disabled={!hasDoc || exporting} onClick={props.onExport}>
         {exporting ? '导出中…' : '导出安全 PDF'}
       </button>
