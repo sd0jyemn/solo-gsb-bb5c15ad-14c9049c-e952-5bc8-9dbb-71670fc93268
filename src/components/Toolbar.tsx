@@ -21,6 +21,8 @@ interface Props {
   onUndo(): void;
   onRedo(): void;
   onClearPage(): void;
+  onExportPlan(): void;
+  onImportPlan(): void;
   onExport(): void;
 }
 
@@ -111,6 +113,23 @@ export function Toolbar(props: Props) {
 
       <button disabled={!hasDoc} onClick={props.onClearPage} title="删除当前页全部遮盖框">
         清空本页
+      </button>
+
+      <div className="sep" />
+
+      <button
+        disabled={!hasDoc}
+        onClick={props.onExportPlan}
+        title="把全部遮盖框与源文件指纹保存为本地方案文件（JSON），不会上传"
+      >
+        导出方案
+      </button>
+      <button
+        disabled={!hasDoc}
+        onClick={props.onImportPlan}
+        title="从本地方案文件（JSON）导入遮盖框，导入前校验源文件与页面尺寸"
+      >
+        导入方案
       </button>
       <button className="primary" disabled={!hasDoc || exporting} onClick={props.onExport}>
         {exporting ? '导出中…' : '导出安全 PDF'}

@@ -120,6 +120,84 @@ button.primary {
   font-size: 13px;
 }
 
+.notice-bar {
+  background: #1d3a26;
+  color: #b7f0c8;
+  padding: 6px 14px;
+  font-size: 13px;
+}
+
+/* ---------- 模态对话框（导入方案确认） ---------- */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px 28px;
+  max-width: 440px;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.6);
+}
+
+.modal h2 {
+  margin: 0 0 12px;
+  font-size: 17px;
+}
+
+.modal p {
+  margin: 0 0 10px;
+  line-height: 1.7;
+  font-size: 13px;
+}
+
+.modal .modal-dim {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.modal-actions button {
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.modal-actions button:hover {
+  border-color: var(--accent);
+}
+
+.modal-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.modal-actions button.danger {
+  background: #5a2222;
+  border-color: #8a3636;
+  color: #ffd5d5;
+}
+
 /* ---------- 主区域 ---------- */
 .main {
   flex: 1;

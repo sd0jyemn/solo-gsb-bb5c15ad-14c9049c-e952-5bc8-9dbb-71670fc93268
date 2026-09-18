@@ -5,6 +5,18 @@ import type { FindHit, HitRect, RedactionBox, RedactionMap, Tool } from './types
 import { uid } from './types';
 import { useUndoable } from './state/useUndoable';
 import { exportRedactedPdf } from './pdf/exportPdf';
+import { sha256Hex } from './pdf/sha256';
+import {
+  PlanError,
+  buildPlan,
+  collectPageSizes,
+  downloadPlan,
+  mergeRedactions,
+  parsePlan,
+  planToRedactionMap,
+  validatePlanForDocument,
+  type PlanPageSize,
+} from './pdf/redactionPlan';
 import {
   PageText,
   parseQueries,
@@ -15,6 +27,7 @@ import { Toolbar } from './components/Toolbar';
 import { PageList } from './components/PageList';
 import { PageCanvas } from './components/PageCanvas';
 import { FindPanel, type FindStatus } from './components/FindPanel';
+import { ImportPlanDialog } from './components/ImportPlanDialog';
 
 const ZOOM_LEVELS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
 
@@ -30,7 +43,18 @@ export default function App() {
   const [exporting, setExporting] = useState(false);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // ---- 遮盖方案导入 / 导出 ----
+  /** 当前源文件的 SHA-256（打开 PDF 时在浏览器本地计算） */
+  const [fileHash, setFileHash] = useState<string | null>(null);
+  /** 校验通过、等待用户选择「替换 / 合并」的方案 */
+  const [pendingPlan, setPendingPlan] = useState<{ boxes: RedactionMap; boxCount: number } | null>(
+    null,
+  );
+  const planInputRef = useRef<HTMLInputElement>(null);
+  const pageSizesCache = useRef<{ doc: PDFDocumentProxy; sizes: PlanPageSize[] } | null>(null);
 
   // ---- 文本查找遮盖 ----
   const [findOpen, setFindOpen] = useState(false);
@@ -70,14 +94,20 @@ export default function App() {
   const openFile = useCallback(
     async (file: File) => {
       setError(null);
+      setNotice(null);
+      setPendingPlan(null);
       scanToken.current += 1; // 中止进行中的查找扫描
       cancelToken.current += 1;
       try {
         const data = await file.arrayBuffer();
+        // 在 pdf.js 接管（detach）ArrayBuffer 之前，先在本地算出源文件 SHA-256
+        const hash = await sha256Hex(data);
         const pdf = await pdfjs.getDocument({ data }).promise;
         void doc?.destroy();
         setDoc(pdf);
         setFileName(file.name);
+        setFileHash(hash);
+        pageSizesCache.current = null;
         setPageNum(1);
         setRotation(0);
         setSelectedId(null);
@@ -90,10 +120,101 @@ export default function App() {
         setAppliedCount(0);
         setFindStatus({ kind: 'idle' });
       } catch {
+        setFileHash(null);
         setError('无法解析该文件，请确认是有效的 PDF。');
       }
     },
     [doc, reset],
+  );
+
+  // ================= 遮盖方案导入 / 导出 =================
+
+  /** 各页尺寸（未旋转页面坐标系，与遮盖框坐标一致），按文档缓存避免重复遍历 */
+  const getPageSizes = useCallback(async (): Promise<PlanPageSize[] | null> => {
+    if (!doc) return null;
+    if (pageSizesCache.current?.doc === doc) return pageSizesCache.current.sizes;
+    const sizes = await collectPageSizes(doc);
+    pageSizesCache.current = { doc, sizes };
+    return sizes;
+  }, [doc]);
+
+  /** 导出方案：版本 + 源文件 SHA-256 + 各页尺寸 + 全部页面坐标遮盖框，下载为 JSON */
+  const exportPlan = useCallback(async () => {
+    if (!doc || !fileHash) return;
+    setError(null);
+    setNotice(null);
+    try {
+      const sizes = await getPageSizes();
+      if (!sizes) return;
+      const plan = buildPlan(fileHash, sizes, redactionsRef.current);
+      downloadPlan(plan, fileName);
+      const count = Object.values(plan.boxes).reduce((sum, list) => sum + list.length, 0);
+      setNotice(`已导出遮盖方案（${count} 处遮盖框），文件仅保存在本机。`);
+    } catch {
+      setError('导出方案失败，请重试。');
+    }
+  }, [doc, fileHash, fileName, getPageSizes]);
+
+  /**
+   * 导入方案：先校验结构（格式损坏），再校验与当前文档的一致性（源文件哈希、
+   * 页数、每页尺寸、矩形边界）；任一项不符即拒绝且保持现状，
+   * 全部通过后才让用户选择「替换」或「合并」。
+   */
+  const importPlanFile = useCallback(
+    async (file: File) => {
+      setError(null);
+      setNotice(null);
+      if (!doc || !fileHash) {
+        setError('请先打开对应的 PDF 文件，再导入遮盖方案。');
+        return;
+      }
+      try {
+        const text = await file.text();
+        const plan = parsePlan(text); // 结构校验：文件损坏 / 格式不符
+        const sizes = await getPageSizes();
+        if (!sizes) return;
+        validatePlanForDocument(plan, { sha256: fileHash, pageSizes: sizes }); // 文档匹配校验
+        const boxes = planToRedactionMap(plan);
+        const boxCount = Object.values(boxes).reduce((sum, list) => sum + list.length, 0);
+        setPendingPlan({ boxes, boxCount });
+      } catch (e) {
+        if (e instanceof PlanError) {
+          setError(
+            e.kind === 'format'
+              ? `导入方案被拒绝：文件已损坏或格式不正确（${e.message}）。当前遮盖未改动。`
+              : `导入方案被拒绝：方案与当前文档不匹配（${e.message}）。当前遮盖未改动。`,
+          );
+        } else {
+          setError('读取方案文件失败，当前遮盖未改动。');
+        }
+      }
+    },
+    [doc, fileHash, getPageSizes],
+  );
+
+  /** 用户确认后应用方案：整次导入只提交一次 setRedactions，即一条撤销记录 */
+  const applyPendingPlan = useCallback(
+    (mode: 'replace' | 'merge') => {
+      const pending = pendingPlan;
+      if (!pending) return;
+      setPendingPlan(null);
+      setSelectedId(null);
+      if (mode === 'replace') {
+        setRedactions(pending.boxes);
+        setNotice(`已用方案替换当前遮盖（${pending.boxCount} 处），可撤销。`);
+        return;
+      }
+      const { merged, added, skipped } = mergeRedactions(redactionsRef.current, pending.boxes);
+      if (added === 0) {
+        setNotice(`方案中的遮盖框与现有完全重复（跳过 ${skipped} 处），未做改动。`);
+        return;
+      }
+      setRedactions(merged);
+      setNotice(
+        `已合并方案：新增 ${added} 处${skipped > 0 ? `，跳过 ${skipped} 处坐标重复` : ''}，可撤销。`,
+      );
+    },
+    [pendingPlan, setRedactions],
   );
 
   // 当前页面对象
@@ -141,15 +262,19 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey);
   });
 
-  // 拖拽 PDF 文件到窗口即可导入
+  // 拖拽 PDF 文件到窗口即可导入（拖入方案 JSON 则导入遮盖方案）
   useEffect(() => {
     const onDrop = (e: DragEvent) => {
       e.preventDefault();
       const file = e.dataTransfer?.files?.[0];
-      if (file && (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf'))) {
+      if (!file) return;
+      const name = file.name.toLowerCase();
+      if (file.type === 'application/pdf' || name.endsWith('.pdf')) {
         void openFile(file);
+      } else if (name.endsWith('.json')) {
+        void importPlanFile(file);
       } else {
-        setError('请拖入 PDF 文件。');
+        setError('请拖入 PDF 文件或遮盖方案（.json）文件。');
       }
     };
     const onDragOver = (e: DragEvent) => e.preventDefault();
@@ -159,7 +284,7 @@ export default function App() {
       window.removeEventListener('drop', onDrop);
       window.removeEventListener('dragover', onDragOver);
     };
-  }, [openFile]);
+  }, [openFile, importPlanFile]);
 
   const mutatePage = (pageNo: number, fn: (boxes: RedactionBox[]) => RedactionBox[]) => {
     const next = fn(redactions[pageNo] ?? []);
@@ -395,6 +520,7 @@ export default function App() {
     setExporting(true);
     setProgress({ done: 0, total: doc.numPages });
     setError(null);
+    setNotice(null);
     try {
       await exportRedactedPdf(doc, redactions, fileName, (done, total) =>
         setProgress({ done, total }),
@@ -420,6 +546,17 @@ export default function App() {
           e.target.value = '';
         }}
       />
+      <input
+        ref={planInputRef}
+        type="file"
+        accept="application/json,.json"
+        hidden
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void importPlanFile(file);
+          e.target.value = '';
+        }}
+      />
 
       <Toolbar
         hasDoc={!!doc}
@@ -442,10 +579,13 @@ export default function App() {
         onUndo={undo}
         onRedo={redo}
         onClearPage={clearPage}
+        onExportPlan={() => void exportPlan()}
+        onImportPlan={() => planInputRef.current?.click()}
         onExport={() => void onExport()}
       />
 
       {error && <div className="error-bar">{error}</div>}
+      {notice && !error && <div className="notice-bar">{notice}</div>}
       {progress && (
         <div className="progress-bar">
           正在按 144 DPI 栅格化并烧入遮盖：第 {progress.done} / {progress.total} 页
@@ -520,6 +660,16 @@ export default function App() {
           </>
         )}
       </footer>
+
+      {pendingPlan && (
+        <ImportPlanDialog
+          boxCount={pendingPlan.boxCount}
+          currentCount={totalBoxes}
+          onReplace={() => applyPendingPlan('replace')}
+          onMerge={() => applyPendingPlan('merge')}
+          onCancel={() => setPendingPlan(null)}
+        />
+      )}
     </div>
   );
 }
